@@ -39,8 +39,12 @@ impl StringReplacer {
         }
     }
 
-    pub fn has_effect(&self) -> bool {
+    pub fn has_search(&self) -> bool {
         return self.search_expression.is_some();
+    }
+
+    pub fn has_replace(&self) -> bool {
+        return self.replace_pattern.is_some();
     }
 
     pub fn do_replace<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
@@ -107,24 +111,37 @@ impl RSRInstance {
         if let Some(filename) = file.file_name() {
             if let Some(filename) = filename.to_str() {
                 if self.filename_replacer.matches(&filename) {
-                    if self.text_replacer.has_effect() {
+                    let mut print_filename = true;
+                    if self.text_replacer.has_replace() {
+                        print_filename = false; // did something so no need to print filename
+                        self.replace_file_contents(&filename, &file);
+                    } else if self.text_replacer.has_search() {
+                        print_filename = false; // did something so no need to print filename
+                        self.search_file_contents(&file);
+                    }
+
+                    // do we need to rename?
+                    if self.filename_replacer.has_replace() {
                         let new_filename = self.filename_replacer.do_replace(filename);
                         let new_path = file.with_file_name(new_filename.as_ref());
 
-                        self.replace_file_contents(&filename, &file, &new_path);
-                    } else if self.filename_replacer.has_effect() {
-                        // no text replace, just move the file
-                        let new_filename = self.filename_replacer.do_replace(filename);
-                        let new_path = file.with_file_name(new_filename.as_ref());
+                        if new_path != file {
+                            print_filename = false; // did something so no need to print filename
 
-                        if self.confirm(&format!("Rename {:?} => {:?}?", file, new_path)) {
-                            if std::fs::rename(file, &new_path).is_ok() {
-                                println!("Failed to rename {:?} to {:?}!", file, new_path);
+                            if self.confirm(&format!("Rename {:?} => {:?}?", file, new_path)) {
+                                if let Err(e) = std::fs::rename(file, &new_path) {
+                                    println!(
+                                        "Failed to rename {:?} to {:?}: {}!",
+                                        file, new_path, e
+                                    );
+                                };
                             }
                         }
-                    } else {
-                        // no text replace, no file move, just output the matched file
-                        info!(self.quiet, "{:?}", file);
+                    }
+
+                    // if we didn't do text search or a rename it's just file match
+                    if print_filename {
+                        info!(self.quiet, "{}", file.to_string_lossy());
                     }
                 }
             } else {
@@ -138,12 +155,7 @@ impl RSRInstance {
         }
     }
 
-    fn replace_file_contents(
-        &self,
-        input_filename: &str,
-        input_path: &std::path::Path,
-        output_path: &std::path::Path,
-    ) {
+    fn replace_file_contents(&self, input_filename: &str, input_path: &std::path::Path) {
         let mut read_option = std::fs::OpenOptions::new();
         read_option.read(true);
 
@@ -159,7 +171,9 @@ impl RSRInstance {
 
                     let mut reader = std::io::BufReader::new(input_file);
                     let mut writer = std::io::BufWriter::new(output_file);
+                    let mut line_number = 1;
                     loop {
+                        line_number += 1; // starts at zero so increment first
                         let mut line = String::new();
 
                         match reader.read_line(&mut line) {
@@ -172,8 +186,11 @@ impl RSRInstance {
                                 let new_line = self.text_replacer.do_replace(&line);
                                 let result = if new_line != line
                                     && self.confirm(&format!(
-                                        "{:?}\n\t{}\n\t=>\n\t{}",
-                                        input_path, line, new_line
+                                        "{}:{}\n\t{}\n\t=>\n\t{}",
+                                        input_path.to_string_lossy(),
+                                        line_number,
+                                        line.trim(),
+                                        new_line.trim()
                                     )) {
                                     writer.write_all(new_line.as_bytes())
                                 } else {
@@ -184,7 +201,7 @@ impl RSRInstance {
                                     // this is actually an error, print regardless of quiet level
                                     println!(
                                         "Skipping {:?} as not all lines could be written to {:?}: {}",
-                                        input_path, output_path, e
+                                        input_path, tmp_file, e
                                     );
                                     std::fs::remove_file(tmp_file).unwrap_or(()); // we don't care if the remove fails
                                     return;
@@ -206,30 +223,12 @@ impl RSRInstance {
                     drop(reader);
                     drop(writer);
 
-                    if self.confirm(&format!(
-                        "Rename & Replace {:?} => {:?}?",
-                        input_path, output_path
-                    )) {
-                        match std::fs::rename(&tmp_file, &output_path) {
-                            Ok(_) => {
-                                if let Err(e) = std::fs::remove_file(&input_path) {
-                                    // this is actually an error, print regardless of quiet level
-                                    println!("Failed to remove file {:?}: {}", input_path, e);
-                                }
-                            }
-                            Err(e) => {
-                                // this is actually an error, print regardless of quiet level
-                                println!(
-                                    "Failed to rename temporary file {:?} to output file {:?}: {}",
-                                    tmp_file, output_path, e
-                                );
-                            }
-                        }
-                    } else {
-                        if let Err(e) = std::fs::remove_file(&tmp_file) {
-                            // this is actually an error, print regardless of quiet level
-                            println!("Failed to remove file {:?}: {}", tmp_file, e);
-                        }
+                    if let Err(e) = std::fs::rename(&tmp_file, &input_path) {
+                        // this is actually an error, print regardless of quiet level
+                        println!(
+                            "Failed to rename temporary file {:?} to original file {:?}: {}",
+                            tmp_file, input_path, e
+                        );
                     }
                 }
                 Err(e) => {
@@ -240,6 +239,57 @@ impl RSRInstance {
                     );
                 }
             }
+        } else {
+            info!(
+                self.quiet,
+                "Skipping {:?} as the the file could not be opened", input_path
+            );
+        }
+    }
+
+    fn search_file_contents(&self, input_path: &std::path::Path) {
+        let mut read_option = std::fs::OpenOptions::new();
+        read_option.read(true);
+
+        if let Ok(input_file) = read_option.open(&input_path) {
+            use std::io::BufRead;
+
+            let mut reader = std::io::BufReader::new(input_file);
+            let mut line_number = 0;
+            loop {
+                line_number += 1; // starts at zero so increment first
+                let mut line = String::new();
+
+                match reader.read_line(&mut line) {
+                    Ok(count) => {
+                        // 0 count indicates we've read everything
+                        if count == 0 {
+                            break;
+                        }
+
+                        if self.text_replacer.matches(&line) {
+                            info!(
+                                self.quiet,
+                                "{}:{: <8}{}",
+                                input_path.to_string_lossy(),
+                                line_number,
+                                line.trim()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // this is actually an error, print regardless of quiet level
+                        println!(
+                            "Skipping {:?} as not all lines could be read: {}",
+                            input_path, e
+                        );
+                        return;
+                    }
+                }
+            }
+
+            // if we got here we've successfully read and written everything, close the files and rename the temp
+            drop(reader);
         } else {
             info!(
                 self.quiet,
@@ -317,7 +367,10 @@ fn main() {
     let input = match args.value_of("input") {
         Some(pattern) => match regex::Regex::new(&pattern) {
             Ok(regex) => Some(regex),
-            Err(_) => None,
+            Err(e) => {
+                println!("Failed to compile regex {}: {}", pattern, e);
+                None
+            }
         },
         None => None,
     };
@@ -328,7 +381,10 @@ fn main() {
     let search = match args.value_of("search") {
         Some(pattern) => match regex::Regex::new(&pattern) {
             Ok(regex) => Some(regex),
-            Err(_) => None,
+            Err(e) => {
+                println!("Failed to compile regex {}: {}", pattern, e);
+                None
+            }
         },
         None => None,
     };
