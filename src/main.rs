@@ -223,6 +223,14 @@ impl RSRInstance {
                     drop(reader);
                     drop(writer);
 
+                    if let Ok(old_metadata) = std::fs::metadata(&input_path) {
+                        if let Err(e) =
+                            std::fs::set_permissions(&tmp_file, old_metadata.permissions())
+                        {
+                            println!("Failed to match permissions for {:?}, permissions may have changed: {}", input_path, e);
+                        }
+                    }
+
                     if let Err(e) = std::fs::rename(&tmp_file, &input_path) {
                         // this is actually an error, print regardless of quiet level
                         println!(
