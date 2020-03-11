@@ -16,19 +16,18 @@ impl StringReplacer {
         search_expression: Option<regex::Regex>,
         replace_pattern: Option<String>,
     ) -> StringReplacer {
-        // if no search but there is a replace we'll need a basic search
-        if search_expression.is_none() && replace_pattern.is_some() {
-            StringReplacer {
+        match (search_expression, replace_pattern) {
+            // if no search but there is a replace we'll need a basic search
+            (None, Some(replace)) => StringReplacer {
                 search_expression: Some(
                     regex::Regex::new(".*").expect("Failed to compile simple '.*' expression"),
                 ),
-                replace_pattern,
-            }
-        } else {
-            StringReplacer {
-                search_expression,
-                replace_pattern,
-            }
+                replace_pattern: Some(replace),
+            },
+            (search, replace) => StringReplacer {
+                search_expression: search,
+                replace_pattern: replace,
+            },
         }
     }
 
